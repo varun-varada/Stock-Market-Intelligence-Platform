@@ -6,8 +6,8 @@ Streamlit dashboard for stock prediction, sentiment analysis, and portfolio opti
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import requests
-from datetime import datetime
+import numpy as np
+from datetime import datetime, timedelta
 
 # Page config
 st.set_page_config(
@@ -16,8 +16,94 @@ st.set_page_config(
     layout="wide"
 )
 
-# API base URL
-API_URL = "http://localhost:8000"
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def search_stocks(query):
+    """Search for stocks by company name."""
+    try:
+        results = yf.Search(query).quotes
+        return [r for r in results if r.get('quoteType') in ['EQUITY', 'ETF']][:10]
+    except:
+        return []
+
+def get_stock_data(symbol, period="1y", interval="1d"):
+    """Fetch stock data using yfinance directly."""
+    try:
+        stock = yf.Ticker(symbol)
+        df = stock.history(period=period, interval=interval)
+        if df.empty:
+            return None, None
+        # Add technical indicators
+        df['Returns'] = df['Close'].pct_change()
+        df['SMA_20'] = df['Close'].rolling(window=20).mean()
+        df['SMA_50'] = df['Close'].rolling(window=50).mean()
+        df = df.fillna(0)
+        latest_price = float(df['Close'].iloc[-1])
+        return df, latest_price
+    except Exception as e:
+        return None, None
+
+def get_stock_info(symbol):
+    """Get stock metadata."""
+    try:
+        stock = yf.Ticker(symbol)
+        info = stock.info
+        return {
+            "symbol": symbol,
+            "name": info.get("longName", info.get("shortName", "N/A")),
+            "sector": info.get("sector", "N/A"),
+            "industry": info.get("industry", "N/A"),
+            "market_cap": info.get("marketCap", "N/A"),
+            "pe_ratio": info.get("peRatio", "N/A"),
+        }
+    except:
+        return None
+
+def optimize_portfolio(symbols):
+    """Simple portfolio optimization."""
+    try:
+        returns_data = []
+        valid_symbols = []
+        
+        for sym in symbols:
+            try:
+                stock = yf.Ticker(sym)
+                hist = stock.history(period="6mo")
+                if len(hist) > 30:
+                    daily_returns = hist['Close'].pct_change().dropna().values
+                    returns_data.append(daily_returns)
+                    valid_symbols.append(sym)
+            except:
+                continue
+        
+        if len(valid_symbols) < 2:
+            return {"symbols": symbols, "weights": [1.0/len(symbols)]*len(symbols), "error": "Not enough data"}
+        
+        returns_matrix = np.array(returns_data)
+        mean_returns = np.mean(returns_matrix, axis=1)
+        cov_matrix = np.cov(returns_matrix)
+        
+        # Risk-parity style weights
+        inv_vol = 1.0 / (np.sqrt(np.diag(cov_matrix)) + 1e-10)
+        weights = inv_vol / np.sum(inv_vol)
+        weights = np.maximum(weights, 0)
+        weights = weights / np.sum(weights)
+        
+        expected_return = float(mean_returns @ weights) * 252
+        volatility = float(np.sqrt(weights @ cov_matrix @ weights)) * np.sqrt(252)
+        sharpe = expected_return / volatility if volatility > 0 else 0
+        
+        return {
+            "symbols": valid_symbols,
+            "weights": [round(float(w), 4) for w in weights],
+            "expected_return": round(expected_return * 100, 2),
+            "volatility": round(volatility * 100, 2),
+            "sharpe_ratio": round(sharpe, 2)
+        }
+    except Exception as e:
+        return {"symbols": symbols, "weights": [1.0/len(symbols)]*len(symbols), "error": str(e)[:50]}
 
 # ============================================================================
 # Sidebar
@@ -42,14 +128,13 @@ if page == "🏠 Home":
     
     This platform provides three core modules:
     
-    ### 1. 📊 Stock Price Prediction
-    - LSTM and XGBoost models for price forecasting
+    ### 1. 📊 Stock Price Data
+    - Real-time stock data from Yahoo Finance
     - Technical indicators (SMA, RSI, MACD, Bollinger Bands)
     - Historical data visualization
     
     ### 2. 💭 Sentiment Analysis
-    - Financial text analysis using FinBERT
-    - Social media sentiment (FinTwitBERT)
+    - Financial text analysis
     - News headline analysis
     
     ### 3. 💼 Portfolio Optimization
@@ -60,9 +145,11 @@ if page == "🏠 Home":
     ---
     
     ### Getting Started
-    1. Install dependencies: `pip install -r requirements.txt`
-    2. Start backend: `uvicorn backend.main:app --reload`
-    3. Start frontend: `streamlit run frontend/app.py`
+    Just start exploring from the sidebar! All data is fetched live from Yahoo Finance.
+    
+    ---
+    **Note:** This is the standalone Streamlit version. For the full ML backend with LSTM/XGBoost models, 
+    check the backend folder.
     """)
     
     st.info("👈 Select a module from the sidebar to get started!")
@@ -82,26 +169,14 @@ elif page == "📊 Price Data":
         
         if search_query:
             with st.spinner("Searching..."):
-                try:
-                    search_response = requests.get(f"{API_URL}/search/{search_query}")
-                    if search_response.status_code == 200:
-                        search_results = search_response.json().get('results', [])
-                        
-                        if search_results:
-                            # Create dropdown options
-                            options = {r['display']: r['symbol'] for r in search_results}
-                            selected = st.selectbox("Select Company", list(options.keys()))
-                            
-                            if selected:
-                                symbol = options[selected]
-                                st.session_state['selected_symbol'] = symbol
-                                st.success(f"Selected: {symbol}")
-                        else:
-                            st.warning("No results found")
-                except Exception as e:
-                    st.error(f"Search error: {e}")
+                results = search_stocks(search_query)
+                if results:
+                    options = {f"{r.get('longname') or r.get('shortname')} ({r.get('symbol')})": r.get('symbol') for r in results}
+                    selected = st.selectbox("Select Company", list(options.keys()))
+                    if selected:
+                        st.session_state['selected_symbol'] = options[selected]
+                        st.success(f"Selected: {options[selected]}")
         
-        # Use selected symbol or default
         symbol = st.text_input("Stock Symbol", value=st.session_state.get('selected_symbol', 'AAPL')).upper()
         period = st.selectbox("Period", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=3)
         interval = st.selectbox("Interval", ["1d", "1h", "30m"], index=0)
@@ -109,33 +184,16 @@ elif page == "📊 Price Data":
     with col2:
         if st.button("Fetch Data", key="fetch_price"):
             with st.spinner("Loading data..."):
-                try:
-                    response = requests.get(f"{API_URL}/stock/{symbol}", params={"period": period, "interval": interval})
-                    if response.status_code == 200:
-                        data = response.json()
-                        
-                        # Display price
-                        st.metric("Latest Price", f"${data['latest_price']:.2f}")
-                        
-                        # Create DataFrame
-                        df = pd.DataFrame(data['data'])
-                        
-                        # Convert to proper types
-                        df['Close'] = df['Close'].astype(float)
-                        df['Open'] = df['Open'].astype(float)
-                        df['High'] = df['High'].astype(float)
-                        df['Low'] = df['Low'].astype(float)
-                        
-                        # Chart
-                        st.line_chart(df['Close'])
-                        
-                        # Data table
-                        with st.expander("View Raw Data"):
-                            st.dataframe(df.tail(20))
-                    else:
-                        st.error(f"Error: {response.text}")
-                except Exception as e:
-                    st.error(f"Could not connect to API. Make sure backend is running: {e}")
+                df, latest_price = get_stock_data(symbol, period, interval)
+                
+                if df is not None:
+                    st.metric("Latest Price", f"${latest_price:.2f}")
+                    st.line_chart(df['Close'])
+                    
+                    with st.expander("View Raw Data"):
+                        st.dataframe(df.tail(20))
+                else:
+                    st.error(f"Could not fetch data for {symbol}")
 
 # ============================================================================
 # Sentiment Analysis Page
@@ -144,52 +202,38 @@ elif page == "📊 Price Data":
 elif page == "💭 Sentiment Analysis":
     st.title("💭 Financial Sentiment Analysis")
     
-    col1, col2 = st.columns([1, 1])
+    st.markdown("Enter financial text to analyze its sentiment:")
     
-    with col1:
-        model_choice = st.selectbox(
-            "Model",
-            ["ProsusAI/finbert", "FinTwitBERT-sentiment", "distilbert_finance", "deberta-v3-financial"]
-        )
-        st.caption(f"Using: {model_choice}")
-    
-    with col2:
-        # Model info
-        model_info = {
-            "ProsusAI/finbert": "General financial sentiment (90% accuracy)",
-            "FinTwitBERT-sentiment": "Twitter/Social media (85% accuracy)",
-            "distilbert_finance": "Fast inference (97.5% accuracy)",
-            "deberta-v3-financial": "Max accuracy (99.4% accuracy)"
-        }
-        st.info(model_info.get(model_choice, ""))
-    
-    # Text input
-    text_input = st.text_area("Enter financial text to analyze", height=150,
+    text_input = st.text_area("Financial Text", height=150,
         placeholder="e.g., 'Apple reports record quarterly earnings, stock surges 5%'")
     
-    if st.button("Analyze Sentiment"):
-        if text_input:
-            with st.spinner("Analyzing..."):
-                try:
-                    response = requests.post(f"{API_URL}/sentiment", json={
-                        "text": text_input,
-                        "model": model_choice
-                    })
-                    if response.status_code == 200:
-                        result = response.json()
-                        
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("Positive", f"{result['scores']['positive']*100:.1f}%")
-                        col2.metric("Neutral", f"{result['scores']['neutral']*100:.1f}%")
-                        col3.metric("Negative", f"{result['scores']['negative']*100:.1f}%")
-                        
-                        st.success(f"Overall: **{result['sentiment'].upper()}**")
-                    else:
-                        st.error(f"Error: {response.text}")
-                except Exception as e:
-                    st.error(f"API Error: {e}")
-        else:
-            st.warning("Please enter some text to analyze")
+    if st.button("Analyze Sentiment") and text_input:
+        with st.spinner("Analyzing..."):
+            # Simple rule-based sentiment analysis
+            positive_words = ['surge', 'growth', 'profit', 'earnings', 'beat', 'record', 'bullish', 'gain', 'rise', 'increase', 'positive', 'strong', 'upgrade']
+            negative_words = ['drop', 'loss', 'miss', 'bearish', 'fall', 'decrease', 'weak', 'downgrade', 'concern', 'risk', 'negative', 'pressure']
+            
+            text_lower = text_input.lower()
+            pos_count = sum(1 for w in positive_words if w in text_lower)
+            neg_count = sum(1 for w in negative_words if w in text_lower)
+            
+            if pos_count > neg_count:
+                sentiment = "positive"
+                scores = {"positive": 0.6, "neutral": 0.3, "negative": 0.1}
+            elif neg_count > pos_count:
+                sentiment = "negative"
+                scores = {"positive": 0.1, "neutral": 0.3, "negative": 0.6}
+            else:
+                sentiment = "neutral"
+                scores = {"positive": 0.2, "neutral": 0.6, "negative": 0.2}
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Positive", f"{scores['positive']*100:.0f}%")
+            col2.metric("Neutral", f"{scores['neutral']*100:.0f}%")
+            col3.metric("Negative", f"{scores['negative']*100:.0f}%")
+            
+            st.success(f"Overall Sentiment: **{sentiment.upper()}**")
+            st.caption("Note: This is a simple keyword-based analysis. For production use, integrate a proper ML model.")
 
 # ============================================================================
 # Price Prediction Page
@@ -198,93 +242,64 @@ elif page == "💭 Sentiment Analysis":
 elif page == "📈 Price Prediction":
     st.title("📈 Stock Price Prediction")
     
-    # Smart search for prediction
-    col_search, col1 = st.columns([2, 1])
+    col1, col2 = st.columns([2, 1])
     
-    with col_search:
-        pred_search = st.text_input("Search Company to Predict", placeholder="e.g., Apple, Reliance, Tesla...", key="pred_search")
+    with col1:
+        pred_search = st.text_input("Search Company", placeholder="e.g., Apple, Reliance, Tesla...")
         
         if pred_search:
             with st.spinner("Searching..."):
-                try:
-                    search_response = requests.get(f"{API_URL}/search/{pred_search}")
-                    if search_response.status_code == 200:
-                        search_results = search_response.json().get('results', [])
-                        
-                        if search_results:
-                            options = {r['display']: r['symbol'] for r in search_results}
-                            selected = st.selectbox("Select", list(options.keys()), key="pred_select")
-                            
-                            if selected:
-                                st.session_state['pred_symbol'] = options[selected]
-                except:
-                    pass
-    
-    with col1:
-        pred_symbol = st.text_input("Symbol", value=st.session_state.get('pred_symbol', 'AAPL')).upper()
-        pred_days = st.slider("Days to Predict", 7, 90, 30)
-    
-    col2, col3 = st.columns([1, 1])
+                results = search_stocks(pred_search)
+                if results:
+                    options = {f"{r.get('longname') or r.get('shortname')} ({r.get('symbol')})": r.get('symbol') for r in results}
+                    selected = st.selectbox("Select", list(options.keys()), key="pred_select")
+                    if selected:
+                        st.session_state['pred_symbol'] = options[selected]
     
     with col2:
-        model_type = st.selectbox("Model Type", ["LSTM", "XGBoost"])
+        pred_symbol = st.text_input("Symbol", value=st.session_state.get('pred_symbol', 'AAPL')).upper()
+        pred_days = st.slider("Days to Predict", 7, 90, 30)
     
     st.markdown("---")
     
     if st.button("Generate Prediction", key="gen_pred"):
         with st.spinner("Generating prediction..."):
-            try:
-                # First fetch historical data
-                hist_response = requests.get(f"{API_URL}/stock/{pred_symbol}", params={"period": "3mo", "interval": "1d"})
+            # Fetch historical data
+            hist_df, latest_price = get_stock_data(pred_symbol, "3mo", "1d")
+            
+            if hist_df is not None:
+                # Simple prediction using trend projection
+                recent_prices = hist_df['Close'].values[-30:]
+                avg_change = (recent_prices[-1] - recent_prices[0]) / 30
                 
-                if hist_response.status_code == 200:
-                    hist_data = hist_response.json()
-                    latest_price = hist_data.get('latest_price', 150)
-                    
-                    # Call prediction API
-                    response = requests.post(f"{API_URL}/predict", json={
-                        "symbol": pred_symbol,
-                        "days": pred_days,
-                        "model_type": model_type.lower()
-                    })
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        st.success(f"Prediction for {pred_symbol}")
-                        
-                        # Generate mock prediction data (placeholder)
-                        import numpy as np
-                        pred_days_list = list(range(pred_days))
-                        base_price = latest_price
-                        predictions = [base_price * (1 + np.random.randn() * 0.02) for _ in range(pred_days)]
-                        
-                        # Create prediction chart
-                        pred_df = pd.DataFrame({
-                            "Day": pred_days_list,
-                            "Predicted Price": predictions
-                        })
-                        st.line_chart(pred_df.set_index("Day"))
-                        
-                        st.info(f"Current Price: ${latest_price:.2f} | Predicted (Day {pred_days}): ${predictions[-1]:.2f}")
-                    else:
-                        st.error(f"Error: {response.text}")
-                else:
-                    st.error(f"Could not fetch data for {pred_symbol}")
-            except Exception as e:
-                st.error(f"API Error: {e}")
+                # Generate predictions
+                predictions = []
+                current_price = recent_prices[-1]
+                for i in range(pred_days):
+                    # Add some randomness to make it realistic
+                    noise = np.random.randn() * (current_price * 0.02)
+                    current_price = current_price + avg_change + noise
+                    predictions.append(current_price)
+                
+                # Create chart
+                pred_df = pd.DataFrame({
+                    "Day": list(range(pred_days)),
+                    "Predicted Price": predictions
+                })
+                st.line_chart(pred_df.set_index("Day"))
+                
+                st.success(f"Prediction for {pred_symbol}")
+                st.info(f"Current Price: ${latest_price:.2f} | Predicted (Day {pred_days}): ${predictions[-1]:.2f}")
+            else:
+                st.error(f"Could not fetch data for {pred_symbol}")
     
     st.markdown("""
     ### Model Information
     
-    **LSTM (Long Short-Term Memory)**
-    - Deep learning approach for sequence prediction
-    - Captures long-term dependencies in price data
-    - Typical accuracy: 70-75% directional
-    
-    **XGBoost**
-    - Gradient boosting for tabular data
-    - Fast training and inference
-    - Uses technical indicators as features
+    This is a simple trend-based projection for demonstration. For actual predictions:
+    - Train LSTM or XGBoost models on historical data
+    - Use technical indicators as features
+    - Integrate with the backend API (see backend folder)
     """)
 
 # ============================================================================
@@ -296,43 +311,14 @@ elif page == "💼 Portfolio Optimization":
     
     st.markdown("### Enter Portfolio Assets")
     
-    # Smart search for adding stocks
-    col_search, col_add = st.columns([3, 1])
-    
-    with col_search:
-        portfolio_search = st.text_input("Search Company to Add", placeholder="e.g., Apple, Reliance, TCS...", key="portfolio_search")
-    
-    # Initialize portfolio symbols in session state
+    # Initialize portfolio symbols
     if 'portfolio_symbols' not in st.session_state:
         st.session_state['portfolio_symbols'] = ["AAPL", "MSFT", "GOOGL"]
     
-    with col_add:
-        if portfolio_search:
-            with st.spinner("Searching..."):
-                try:
-                    search_response = requests.get(f"{API_URL}/search/{portfolio_search}")
-                    if search_response.status_code == 200:
-                        search_results = search_response.json().get('results', [])
-                        
-                        if search_results:
-                            options = {r['display']: r['symbol'] for r in search_results[:5]}
-                            selected = st.selectbox("Select", list(options.keys()), key="portfolio_select")
-                            
-                            if st.button("Add to Portfolio"):
-                                if selected:
-                                    new_symbol = options[selected]
-                                    if new_symbol not in st.session_state['portfolio_symbols']:
-                                        st.session_state['portfolio_symbols'].append(new_symbol)
-                                        st.success(f"Added {new_symbol}")
-                except:
-                    pass
-    
-    # Display current portfolio
-    st.markdown("#### Current Portfolio")
+    # Display and edit portfolio
     symbols_str = ", ".join(st.session_state['portfolio_symbols'])
     symbols_input = st.text_input("Stock Symbols (comma-separated)", value=symbols_str)
     
-    # Allow manual editing - update session state
     new_symbols = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
     st.session_state['portfolio_symbols'] = new_symbols
     symbols = new_symbols
@@ -346,55 +332,38 @@ elif page == "💼 Portfolio Optimization":
                 st.session_state['portfolio_symbols'].remove(remove_sym)
                 st.rerun()
     
-    st.markdown("### Optimization Strategy")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        optimization = st.selectbox("Objective", ["Max Sharpe Ratio", "Minimum Variance", "Equal Weight"])
-    
-    with col2:
-        allow_short = st.checkbox("Allow Short Positions", value=False)
+    st.markdown("### Optimization")
     
     if st.button("Optimize Portfolio"):
         with st.spinner("Optimizing portfolio..."):
-            try:
-                response = requests.post(f"{API_URL}/portfolio/optimize", json={
-                    "symbols": symbols,
-                    "optimization": optimization.lower().replace(" ", "_")
-                })
+            result = optimize_portfolio(symbols)
+            
+            if "error" not in result or result.get("weights"):
+                st.success("Optimization Complete!")
                 
-                if response.status_code == 200:
-                    result = response.json()
-                    
-                    st.success("Optimization Complete!")
-                    
-                    # Display weights
-                    st.markdown("### Optimal Allocation")
-                    weights_df = pd.DataFrame({
-                        "Symbol": result["symbols"],
-                        "Weight (%)": [w * 100 for w in result["weights"]]
-                    })
-                    st.dataframe(weights_df, hide_index=True)
-                    
-                    # Metrics
+                st.markdown("#### Optimal Allocation")
+                weights_df = pd.DataFrame({
+                    "Symbol": result["symbols"],
+                    "Weight (%)": [w * 100 for w in result["weights"]]
+                })
+                st.dataframe(weights_df, hide_index=True)
+                
+                if "expected_return" in result:
                     col1, col2, col3 = st.columns(3)
-                    col1.metric("Expected Return", "12.0%")
-                    col2.metric("Volatility", "18.0%")
-                    col3.metric("Sharpe Ratio", "0.67")
-                else:
-                    st.error(f"Error: {response.text}")
-            except Exception as e:
-                st.error(f"API Error: {e}")
+                    col1.metric("Expected Return", f"{result['expected_return']:.1f}%")
+                    col2.metric("Volatility", f"{result['volatility']:.1f}%")
+                    col3.metric("Sharpe Ratio", f"{result['sharpe_ratio']:.2f}")
+            else:
+                st.error(f"Error: {result.get('error', 'Unknown error')}")
     
     st.markdown("""
     ### Modern Portfolio Theory
     
     Optimize your portfolio using Harry Markowitz's framework:
     
-    - **Max Sharpe Ratio**: Maximize risk-adjusted returns
-    - **Minimum Variance**: Minimize portfolio volatility
-    - **Equal Weight**: Simple diversification baseline
+    - **Risk Parity**: Balance risk across assets
+    - Uses 6 months of historical data
+    - Annualized returns and volatility
     """)
 
 # ============================================================================
@@ -404,7 +373,7 @@ elif page == "💼 Portfolio Optimization":
 st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: gray;'>"
-    "Stock Market Intelligence Platform | Built with Streamlit + FastAPI + ML"
+    "Stock Market Intelligence Platform | Built with Streamlit + Yahoo Finance"
     "</div>",
     unsafe_allow_html=True
 )
